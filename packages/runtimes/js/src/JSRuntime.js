@@ -11,12 +11,7 @@ import type {
 } from '@parcel/types';
 
 import {Runtime} from '@parcel/plugin';
-import {
-  relativeBundlePath,
-  validateSchema,
-  type SchemaEntity,
-} from '@parcel/utils';
-import {encodeJSONKeyComponent} from '@parcel/diagnostic';
+import {relativeBundlePath, urlJoin} from '@parcel/utils';
 import path from 'path';
 import nullthrows from 'nullthrows';
 
@@ -70,52 +65,8 @@ let bundleDependencies = new WeakMap<
   |},
 >();
 
-type JSRuntimeConfig = {|
-  splitManifestThreshold: number,
-|};
-
-let defaultConfig: JSRuntimeConfig = {
-  splitManifestThreshold: 100000,
-};
-
-const CONFIG_SCHEMA: SchemaEntity = {
-  type: 'object',
-  properties: {
-    splitManifestThreshold: {
-      type: 'number',
-    },
-  },
-  additionalProperties: false,
-};
-
 export default (new Runtime({
-  async loadConfig({config, options}): Promise<JSRuntimeConfig> {
-    let packageKey = '@parcel/runtime-js';
-    let conf = await config.getConfig<JSRuntimeConfig>([], {
-      packageKey,
-    });
-
-    if (!conf) {
-      return defaultConfig;
-    }
-    validateSchema.diagnostic(
-      CONFIG_SCHEMA,
-      {
-        data: conf?.contents,
-        source: await options.inputFS.readFile(conf.filePath, 'utf8'),
-        filePath: conf.filePath,
-        prependKey: `/${encodeJSONKeyComponent(packageKey)}`,
-      },
-      packageKey,
-      `Invalid config for ${packageKey}`,
-    );
-
-    return {
-      ...defaultConfig,
-      ...conf?.contents,
-    };
-  },
-  apply({bundle, bundleGraph, options, config}) {
+  apply({bundle, bundleGraph, options}) {
     // Dependency ids in code replaced with referenced bundle names
     // Loader runtime added for bundle groups that don't have a native loader (e.g. HTML/CSS/Worker - isURL?),
     // and which are not loaded by a parent bundle.
@@ -143,7 +94,7 @@ export default (new Runtime({
           // The linker handles this for scope-hoisting.
           assets.push({
             filePath: __filename,
-            code: `module.exports = Promise.resolve(module.bundle.root(${JSON.stringify(
+            code: `module.exports = Promise.resolve(parcelRequire(${JSON.stringify(
               bundleGraph.getAssetPublicId(resolved.value),
             )}))`,
             dependency,
@@ -232,18 +183,40 @@ export default (new Runtime({
 
       // Skip URL runtimes for library builds. This is handled in packaging so that
       // the url is inlined and statically analyzable.
-      if (bundle.env.isLibrary && dependency.meta?.placeholder != null) {
+      if (bundle.env.isLibrary && mainBundle.bundleBehavior !== 'isolated') {
         continue;
       }
 
       // URL dependency or not, fall back to including a runtime that exports the url
-      assets.push(getURLRuntime(dependency, bundle, mainBundle, options));
+      let mainAsset = mainBundle
+        .getEntryAssets()
+        .find(e => e.id === bundleGroup.entryAssetId);
+      if (
+        dependency.specifierType === 'url' ||
+        mainAsset?.meta.jsRuntime === 'url'
+      ) {
+        assets.push(getURLRuntime(dependency, bundle, mainBundle, options));
+        continue;
+      }
+
+      if (mainBundle.type === 'node' && mainBundle.env.isNode()) {
+        let relativePathExpr = getAbsoluteUrlExpr(
+          getRelativePathExpr(bundle, mainBundle, options),
+          mainBundle,
+        );
+        assets.push({
+          filePath: __filename,
+          code: `module.exports = require('./helpers/node/node-loader.js')(${relativePathExpr});`,
+          dependency,
+          env: {sourceType: 'module'},
+        });
+      }
     }
 
     // In development, bundles can be created lazily. This means that the parent bundle may not
     // know about all of the sibling bundles of a child when it is written for the first time.
     // Therefore, we need to also ensure that the siblings are loaded when the child loads.
-    if (options.shouldBuildLazily && bundle.env.outputFormat === 'global') {
+    if (options.shouldBuildLazily && !bundle.env.shouldScopeHoist) {
       let referenced = bundleGraph.getReferencedBundles(bundle);
       for (let referencedBundle of referenced) {
         let loaders = getLoaders(bundle.env);
@@ -285,11 +258,6 @@ export default (new Runtime({
         code: getRegisterCode(bundle, bundleGraph),
         isEntry: true,
         env: {sourceType: 'module'},
-        priority: getManifestBundlePriority(
-          bundleGraph,
-          bundle,
-          config.splitManifestThreshold,
-        ),
       });
     }
 
@@ -424,10 +392,7 @@ function getLoaderRuntime({
 
     // In development, clear the require cache when an error occurs so the
     // user can try again (e.g. after fixing a build error).
-    if (
-      options.mode === 'development' &&
-      bundle.env.outputFormat === 'global'
-    ) {
+    if (options.mode === 'development' && !bundle.env.shouldScopeHoist) {
       code +=
         '.catch(err => {delete module.bundle.cache[module.id]; throw err;})';
     }
@@ -476,12 +441,27 @@ function getLoaderRuntime({
   }
 
   if (mainBundle.type === 'js') {
-    let parcelRequire = bundle.env.shouldScopeHoist
-      ? 'parcelRequire'
-      : 'module.bundle.root';
-    loaderCode += `.then(() => ${parcelRequire}('${bundleGraph.getAssetPublicId(
+    loaderCode += `.then(() => parcelRequire('${bundleGraph.getAssetPublicId(
       bundleGraph.getAssetById(bundleGroup.entryAssetId),
     )}'))`;
+  }
+
+  if (needsEsmLoadPrelude && options.featureFlags.importRetry) {
+    loaderCode = `
+      Object.defineProperty(module, 'exports', { get: () => {
+        let load = require('./helpers/browser/esm-js-loader-retry');
+        return ${loaderCode}.then((v) => {
+          Object.defineProperty(module, "exports", { value: Promise.resolve(v) })
+          return v
+        });
+      }})`;
+
+    return {
+      filePath: __filename,
+      code: loaderCode,
+      dependency,
+      env: {sourceType: 'module'},
+    };
   }
 
   let code = [];
@@ -588,7 +568,7 @@ function getURLRuntime(
   to: NamedBundle,
   options: PluginOptions,
 ): RuntimeAsset {
-  let relativePathExpr = getRelativePathExpr(from, to, options);
+  let relativePathExpr = getRelativePathExpr(from, to, options, true);
   let code;
 
   if (dependency.meta.webworker === true && !from.env.isLibrary) {
@@ -608,6 +588,10 @@ function getURLRuntime(
         from.env.outputFormat === 'esmodule',
       )});`;
     }
+  } else if (from.env.isServer() && to.env.isBrowser()) {
+    code = `module.exports = ${JSON.stringify(
+      urlJoin(to.target.publicUrl, to.name),
+    )};`;
   } else {
     code = `module.exports = ${getAbsoluteUrlExpr(relativePathExpr, from)};`;
   }
@@ -669,10 +653,11 @@ function getRelativePathExpr(
   from: NamedBundle,
   to: NamedBundle,
   options: PluginOptions,
+  isURL = to.type !== 'js',
 ): string {
   let relativePath = relativeBundlePath(from, to, {leadingDotSlash: false});
   let res = JSON.stringify(relativePath);
-  if (options.hmrOptions) {
+  if (isURL && options.hmrOptions) {
     res += ' + "?" + Date.now()';
   }
 
@@ -683,7 +668,8 @@ function getAbsoluteUrlExpr(relativePathExpr: string, bundle: NamedBundle) {
   if (
     (bundle.env.outputFormat === 'esmodule' &&
       bundle.env.supports('import-meta-url')) ||
-    bundle.env.outputFormat === 'commonjs'
+    bundle.env.outputFormat === 'commonjs' ||
+    bundle.env.isNode()
   ) {
     // This will be compiled to new URL(url, import.meta.url) or new URL(url, 'file:' + __filename).
     return `new __parcel__URL__(${relativePathExpr}).toString()`;
@@ -703,22 +689,4 @@ function shouldUseRuntimeManifest(
     env.isBrowser() &&
     options.mode === 'production'
   );
-}
-
-function getManifestBundlePriority(
-  bundleGraph: BundleGraph<NamedBundle>,
-  bundle: NamedBundle,
-  threshold: number,
-): $PropertyType<RuntimeAsset, 'priority'> {
-  let bundleSize = 0;
-
-  bundle.traverseAssets((asset, _, actions) => {
-    bundleSize += asset.stats.size;
-
-    if (bundleSize > threshold) {
-      actions.stop();
-    }
-  });
-
-  return bundleSize > threshold ? 'parallel' : 'sync';
 }

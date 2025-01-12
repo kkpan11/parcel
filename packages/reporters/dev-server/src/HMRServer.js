@@ -1,5 +1,4 @@
 // @flow
-
 import type {
   Asset,
   BundleGraph,
@@ -46,6 +45,9 @@ export type HMRMessage =
       assets: Array<HMRAsset>,
     |}
   | {|
+      type: 'reload',
+    |}
+  | {|
       type: 'error',
       diagnostics: {|
         ansi: Array<AnsiDiagnosticResult>,
@@ -55,6 +57,7 @@ export type HMRMessage =
 
 const FS_CONCURRENCY = 64;
 const HMR_ENDPOINT = '/__parcel_hmr';
+const BROADCAST_MAX_ASSETS = 10000;
 
 export default class HMRServer {
   wss: WebSocket.Server;
@@ -72,6 +75,10 @@ export default class HMRServer {
     let server = this.options.devServer;
     if (!server) {
       let result = await createHTTPServer({
+        https: this.options.https,
+        inputFS: this.options.inputFS,
+        outputFS: this.options.outputFS,
+        cacheDir: this.options.cacheDir,
         listener: (req, res) => {
           setHeaders(res);
           if (!this.handle(req, res)) {
@@ -119,6 +126,9 @@ export default class HMRServer {
       this.stopServer = null;
     }
     this.wss.close();
+    for (const ws of this.wss.clients) {
+      ws.terminate();
+    }
   }
 
   async emitError(options: PluginOptions, diagnostics: Array<Diagnostic>) {
@@ -150,16 +160,16 @@ export default class HMRServer {
     this.broadcast(this.unresolvedError);
   }
 
-  async emitUpdate(event: {
+  async getUpdate(event: {
     +bundleGraph: BundleGraph<PackagedBundle> | BundleGraph<NamedBundle>,
     +changedAssets: Map<string, Asset>,
     ...
-  }) {
+  }): Promise<?HMRMessage> {
     this.unresolvedError = null;
     this.bundleGraph = event.bundleGraph;
 
     let changedAssets = new Set(event.changedAssets.values());
-    if (changedAssets.size === 0) return;
+    if (changedAssets.size === 0) return Promise.resolve(null);
 
     let queue = new PromiseQueue({maxConcurrent: FS_CONCURRENCY});
     for (let asset of changedAssets) {
@@ -217,10 +227,15 @@ export default class HMRServer {
     }
 
     let assets = await queue.run();
-    this.broadcast({
-      type: 'update',
-      assets: assets,
-    });
+    if (assets.length >= BROADCAST_MAX_ASSETS) {
+      // Too many assets to send via an update without errors, just reload instead
+      return {type: 'reload'};
+    } else if (assets.length > 0) {
+      return {
+        type: 'update',
+        assets,
+      };
+    }
   }
 
   async getHotAssetContents(asset: Asset): Promise<string> {
@@ -235,7 +250,9 @@ export default class HMRServer {
     if (sourcemap) {
       let sourcemapStringified = await sourcemap.stringify({
         format: 'inline',
-        sourceRoot: SOURCES_ENDPOINT + '/',
+        sourceRoot:
+          (asset.env.isNode() ? this.options.projectRoot : SOURCES_ENDPOINT) +
+          '/',
         // $FlowFixMe
         fs: asset.fs,
       });
@@ -250,7 +267,11 @@ export default class HMRServer {
 
   getSourceURL(asset: Asset): string {
     let origin = '';
-    if (!this.options.devServer) {
+    if (
+      !this.options.devServer ||
+      // $FlowFixMe
+      this.bundleGraph?.getEntryBundles().some(b => b.env.isServer())
+    ) {
       origin = `http://${this.options.host || 'localhost'}:${
         this.options.port
       }`;

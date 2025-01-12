@@ -13,7 +13,7 @@ import type {
 } from './types';
 import type ParcelConfig from './ParcelConfig';
 import type PluginOptions from './public/PluginOptions';
-import type {RunAPI} from './RequestTracker';
+import type {RequestResult, RunAPI} from './RequestTracker';
 
 import path from 'path';
 import assert from 'assert';
@@ -38,29 +38,10 @@ type RuntimeConnection = {|
   assetGroup: AssetGroup,
   dependency: ?Dependency,
   isEntry: ?boolean,
+  shouldReplaceResolution: ?boolean,
 |};
 
-function nameRuntimeBundle(
-  bundle: InternalBundle,
-  siblingBundle: InternalBundle,
-) {
-  // We don't run custom namers on runtime bundles as the runtime assumes that they are
-  // located at the same nesting level as their owning bundle. Custom naming could
-  // be added in future as long as the custom name is validated.
-  let {hashReference} = bundle;
-
-  let name = nullthrows(siblingBundle.name)
-    // Remove the existing hash from standard file patterns
-    // e.g. 'main.[hash].js' -> 'main.js' or 'main~[hash].js' -> 'main.js'
-    .replace(new RegExp(`[\\.~\\-_]?${siblingBundle.hashReference}`), '')
-    // Ensure the file ends with 'runtime.[hash].js'
-    .replace(`.${bundle.type}`, `.runtime.${hashReference}.${bundle.type}`);
-
-  bundle.name = name;
-  bundle.displayName = name.replace(hashReference, '[hash]');
-}
-
-export default async function applyRuntimes<TResult>({
+export default async function applyRuntimes<TResult: RequestResult>({
   bundleGraph,
   config,
   options,
@@ -84,16 +65,7 @@ export default async function applyRuntimes<TResult>({
   let runtimes = await config.getRuntimes();
   let connections: Array<RuntimeConnection> = [];
 
-  // As manifest bundles may be added during runtimes we process them in reverse topological
-  // sort order. This allows bundles to be added to their bundle groups before they are referenced
-  // by other bundle groups by loader runtimes
-  let bundles = [];
-  bundleGraph.traverseBundles({
-    exit(bundle) {
-      bundles.push(bundle);
-    },
-  });
-
+  let bundles = bundleGraph.getBundles({includeInline: true});
   for (let bundle of bundles) {
     for (let runtime of runtimes) {
       let measurement;
@@ -128,11 +100,11 @@ export default async function applyRuntimes<TResult>({
             filePath,
             isEntry,
             env,
-            priority,
+            shouldReplaceResolution,
           } of runtimeAssets) {
             let sourceName = path.join(
               path.dirname(filePath),
-              `runtime-${hashString(code)}.${bundle.type}`,
+              `runtime-${hashString(code)}${path.extname(filePath)}`,
             );
 
             let assetGroup = {
@@ -144,39 +116,12 @@ export default async function applyRuntimes<TResult>({
               isSource: true,
             };
 
-            let connectionBundle = bundle;
-
-            if (priority === 'parallel' && !bundle.needsStableName) {
-              let bundleGroups =
-                bundleGraph.getBundleGroupsContainingBundle(bundle);
-
-              connectionBundle = nullthrows(
-                bundleGraph.createBundle({
-                  type: bundle.type,
-                  needsStableName: false,
-                  env: bundle.env,
-                  target: bundle.target,
-                  uniqueKey: 'runtime-manifest:' + bundle.id,
-                  shouldContentHash: options.shouldContentHash,
-                }),
-              );
-
-              for (let bundleGroup of bundleGroups) {
-                bundleGraph.addBundleToBundleGroup(
-                  connectionBundle,
-                  bundleGroup,
-                );
-              }
-              bundleGraph.createBundleReference(bundle, connectionBundle);
-
-              nameRuntimeBundle(connectionBundle, bundle);
-            }
-
             connections.push({
-              bundle: connectionBundle,
+              bundle,
               assetGroup,
               dependency,
               isEntry,
+              shouldReplaceResolution,
             });
           }
         }
@@ -191,9 +136,6 @@ export default async function applyRuntimes<TResult>({
       }
     }
   }
-
-  // Correct connection order after generating runtimes in reverse order
-  connections.reverse();
 
   // Add dev deps for runtime plugins AFTER running them, to account for lazy require().
   for (let runtime of runtimes) {
@@ -231,7 +173,13 @@ export default async function applyRuntimes<TResult>({
     bundleGraph._assetPublicIds.add(publicId);
   }
 
-  for (let {bundle, assetGroup, dependency, isEntry} of connections) {
+  for (let {
+    bundle,
+    assetGroup,
+    dependency,
+    isEntry,
+    shouldReplaceResolution,
+  } of connections) {
     let assetGroupNode = nodeFromAssetGroup(assetGroup);
     let assetGroupAssetNodeIds = runtimesAssetGraph.getNodeIdsConnectedFrom(
       runtimesAssetGraph.getNodeIdByContentKey(assetGroupNode.id),
@@ -318,13 +266,22 @@ export default async function applyRuntimes<TResult>({
         dependency.id,
       );
       bundleGraph._graph.addEdge(dependencyNodeId, bundleGraphRuntimeNodeId);
+
+      if (shouldReplaceResolution && resolution) {
+        let resolutionNodeId = bundleGraph._graph.getNodeIdByContentKey(
+          resolution.id,
+        );
+        bundleGraph._graph.removeEdge(dependencyNodeId, resolutionNodeId);
+        bundleGraph._graph.addEdge(dependencyNodeId, resolutionNodeId);
+        // TODO: remove asset from bundle?
+      }
     }
   }
 
   return changedAssets;
 }
 
-function reconcileNewRuntimes<TResult>(
+function reconcileNewRuntimes<TResult: RequestResult>(
   api: RunAPI<TResult>,
   connections: Array<RuntimeConnection>,
   optionsRef: SharedReference,
