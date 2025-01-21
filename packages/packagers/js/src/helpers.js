@@ -1,5 +1,7 @@
 // @flow strict-local
-import type {Environment} from '@parcel/types';
+import type {Environment, NamedBundle} from '@parcel/types';
+import {relativePath} from '@parcel/utils';
+import path from 'path';
 
 export const prelude = (parcelRequireName: string): string => `
 var $parcel$modules = {};
@@ -160,10 +162,132 @@ function $parcel$defineInteropFlag(a) {
 }
 `;
 
+const $parcel$distDir = (env: Environment, bundle: NamedBundle): string => {
+  // Generate a relative path from this bundle to the root of the dist dir.
+  let distDir = relativePath(path.dirname(bundle.name), '');
+  if (!distDir.endsWith('/')) {
+    distDir += '/';
+  }
+  return `var $parcel$distDir = ${JSON.stringify(distDir)};\n`;
+};
+
+const $parcel$publicUrl = (env: Environment, bundle: NamedBundle): string => {
+  // Ensure the public url always ends with a slash to code can easily join paths to it.
+  let publicUrl = bundle.target.publicUrl;
+  if (!publicUrl.endsWith('/')) {
+    publicUrl += '/';
+  }
+  return `var $parcel$publicUrl = ${JSON.stringify(publicUrl)};\n`;
+};
+
+const $parcel$extendImportMap = (env: Environment): string => {
+  let defineImportMap = env.shouldScopeHoist
+    ? 'parcelRequire.i ??= {}'
+    : 'importMap';
+  return `
+function $parcel$extendImportMap(map) {
+  Object.assign(${defineImportMap}, map);
+}
+`;
+};
+
+const $parcel$import = (
+  env: Environment,
+  bundle: NamedBundle,
+  usedHelpers: Set<string>,
+): string => {
+  usedHelpers.add('$parcel$distDir');
+  let distDir = env.shouldScopeHoist ? '$parcel$distDir' : 'distDir';
+  let importMap = env.shouldScopeHoist ? 'parcelRequire.i?.' : 'importMap';
+  return `
+function $parcel$import(url) {
+  url = ${importMap}[url] || url;
+  return import(${distDir} + url);
+}
+`;
+};
+
+const $parcel$resolve = (
+  env: Environment,
+  bundle: NamedBundle,
+  usedHelpers: Set<string>,
+): string => {
+  let distDir = env.shouldScopeHoist ? '$parcel$distDir' : 'distDir';
+  let publicUrl = env.shouldScopeHoist ? '$parcel$publicUrl' : 'publicUrl';
+  let importMap = env.shouldScopeHoist ? 'parcelRequire.i?.' : 'importMap';
+  if (env.context === 'react-server' || env.context === 'react-client') {
+    usedHelpers.add('$parcel$publicUrl');
+    return `
+function $parcel$resolve(url) {
+url = ${importMap}[url] || url;
+return ${publicUrl} + url;
+}
+`;
+  } else if (
+    env.outputFormat === 'esmodule' &&
+    env.supports('import-meta-resolve')
+  ) {
+    usedHelpers.add('$parcel$distDir');
+    return `
+function $parcel$resolve(url) {
+  url = ${importMap}[url] || url;
+  return import.meta.resolve(${distDir} + url);
+}
+`;
+  } else if (
+    env.outputFormat === 'esmodule' &&
+    env.supports('import-meta-url')
+  ) {
+    usedHelpers.add('$parcel$distDir');
+    return `
+function $parcel$resolve(url) {
+  url = ${importMap}[url] || url;
+  return new URL(${distDir} + url, import.meta.url).toString();
+}
+`;
+  } else if (env.outputFormat === 'commonjs' || env.isNode()) {
+    usedHelpers.add('$parcel$distDir');
+    return `
+function $parcel$resolve(url) {
+  url = ${importMap}[url] || url;
+  return new URL(${distDir} + url, 'file:' + __filename).toString();
+}
+`;
+  } else {
+    usedHelpers.add('$parcel$distDir');
+    return `
+var $parcel$bundleURL;
+function $parcel$resolve(url) {
+  url = ${importMap}[url] || url;
+  if (!$parcel$bundleURL) {
+    try {
+      throw new Error();
+    } catch (err) {
+      var matches = ('' + err.stack).match(
+        /(https?|file|ftp|(chrome|moz|safari-web)-extension):\\/\\/[^)\\n]+/g,
+      );
+      if (matches) {
+        $parcel$bundleURL = matches[0];
+      } else {
+        return ${distDir} + url;
+      }
+    }
+  }
+  return new URL(${distDir} + url, $parcel$bundleURL).toString();
+}
+`;
+  }
+};
+
 export const helpers = {
   $parcel$export,
   $parcel$exportWildcard,
   $parcel$interopDefault,
   $parcel$global,
   $parcel$defineInteropFlag,
+  $parcel$distDir,
+  $parcel$publicUrl,
+  $parcel$extendImportMap,
+  $parcel$import,
+  $parcel$resolve,
 };
